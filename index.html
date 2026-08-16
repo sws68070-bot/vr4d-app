@@ -1042,6 +1042,12 @@
         #camera-status {
             position: fixed; top: 30px; left: 50%; transform: translateX(-50%);
             background: rgba(5, 5, 10, 0.8); color: white; padding: 10px 24px; border-radius: 30px; font-size: 13.5px; z-index: 100; border: 1px solid rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);
+            max-width: 88vw; text-align: center; line-height: 1.5;
+        }
+        #camera-status .retry-btn {
+            display: inline-block; margin-top: 8px; padding: 6px 16px; border-radius: 20px;
+            background: rgba(0, 102, 254, 0.85); color: white; font-size: 13px; font-weight: 600;
+            border: none; cursor: pointer;
         }
         
         .app-sandbox { width: 100%; height: 100%; border: none; background: transparent; }
@@ -1198,6 +1204,7 @@
         const cameraStatus = document.getElementById('camera-status');
         let streamActive = null;
         let handsProcessing = false; // trava simples pra nunca ter 2 frames sendo processados pelo modelo ao mesmo tempo
+        let handFrameLoopActive = false;
         // Curvatura 3D ativa por padrão. O bug de clique/flicker era causado por
         // overflow:hidden + backdrop-filter no MESMO elemento que girava (rotateY);
         // agora a rotação vive numa camada separada (.vr-window-rotor) sem overflow
@@ -1404,6 +1411,28 @@
             throw lastErr;
         }
 
+        // Loop de frames feito à mão, SEM usar a classe Camera do @mediapipe/camera_utils.
+        // Motivo: Camera.start() chama getUserMedia() por conta própria por baixo dos panos,
+        // mesmo quando o <video> já tem um srcObject definido — isso faz o navegador tentar
+        // abrir DOIS streams de câmera ao mesmo tempo, e é justamente isso que travava o
+        // hardware com "NotReadableError" no Android, mesmo depois de limpar o cache.
+        function startHandFrameLoop() {
+            handFrameLoopActive = true;
+            const loop = async () => {
+                if (!handFrameLoopActive) return;
+                if (handTrackingActive && !handsProcessing && video.readyState >= 2) {
+                    handsProcessing = true;
+                    try { await handsEngine.send({image: video}); }
+                    finally { handsProcessing = false; }
+                }
+                requestAnimationFrame(loop);
+            };
+            requestAnimationFrame(loop);
+        }
+        function stopHandFrameLoop() {
+            handFrameLoopActive = false;
+        }
+
         async function initCamera(retryCount = 0) {
             try {
                 // Garante que nenhum stream antigo ficou preso ao hardware antes de pedir outro
@@ -1411,42 +1440,43 @@
                     streamActive.getTracks().forEach(track => track.stop());
                     streamActive = null;
                 }
+                stopHandFrameLoop();
                 streamActive = await getCameraStreamWithFallback();
                 video.srcObject = streamActive;
+                await video.play().catch(() => {}); // alguns navegadores exigem play() explícito após trocar srcObject
                 cameraStatus.style.display = 'none';
-                
-                cameraEngine = new Camera(video, {
-                    onFrame: async () => {
-                        // Evita empilhar frames se o modelo ainda estiver processando o anterior
-                        // (senão a fila cresce e o rastreamento vai ficando cada vez mais atrasado)
-                        if (handTrackingActive && !handsProcessing) {
-                            handsProcessing = true;
-                            try { await handsEngine.send({image: video}); }
-                            finally { handsProcessing = false; }
-                        }
-                    },
-                    width: 480,   // menor = inferência mais rápida; landmarks já são normalizados (0-1), então a nitidez visual não muda
-                    height: 360
-                });
-                cameraEngine.start();
+                cameraStatus.innerHTML = '';
+
+                startHandFrameLoop();
             } catch (err) {
                 // NotReadableError costuma ser transitório (câmera ainda sendo liberada
-                // pelo navegador/SO) — tenta mais uma vez automaticamente antes de desistir
-                if (err && err.name === 'NotReadableError' && retryCount < 2) {
-                    setTimeout(() => initCamera(retryCount + 1), 500);
+                // pelo navegador/SO, ou presa por outro app) — tenta de novo automaticamente
+                // várias vezes, com espera crescente, antes de pedir ajuda manual.
+                if (err && err.name === 'NotReadableError' && retryCount < 4) {
+                    const delay = 600 * (retryCount + 1); // 600ms, 1200ms, 1800ms, 2400ms
+                    cameraStatus.innerHTML = `Câmera ocupada, tentando de novo (${retryCount + 1}/4)...`;
+                    cameraStatus.style.display = 'block';
+                    setTimeout(() => initCamera(retryCount + 1), delay);
                     return;
                 }
-                const msg = (err && err.name === 'NotReadableError')
-                    ? "Câmera ocupada por outro app — feche outras abas/apps que usam a câmera e toque no ícone de câmera pra tentar de novo."
-                    : "Modo Espacial 3D Ativo (Sem Câmera)";
-                cameraStatus.innerText = msg;
-                setTimeout(() => cameraStatus.style.display = 'none', 4500);
+                if (err && err.name === 'NotReadableError') {
+                    // Depois de 4 tentativas automáticas sem sucesso, é quase sempre outro
+                    // app/aba segurando o hardware da câmera — deixa um botão pra tentar de
+                    // novo manualmente em vez de recarregar a página inteira.
+                    cameraStatus.innerHTML = `Câmera não respondeu. Feche outros apps/abas que usam a câmera (WhatsApp, outra aba com câmera aberta, etc).<br><button class="retry-btn" onclick="cameraStatus.innerHTML='Tentando...'; initCamera();">Tentar novamente</button>`;
+                    cameraStatus.style.display = 'block';
+                } else {
+                    cameraStatus.innerText = "Modo Espacial 3D Ativo (Sem Câmera)";
+                    cameraStatus.style.display = 'block';
+                    setTimeout(() => cameraStatus.style.display = 'none', 4500);
+                }
             }
 
         }
 
         function toggleCamera() {
             if (streamActive) {
+                stopHandFrameLoop();
                 streamActive.getTracks().forEach(track => track.stop());
                 video.srcObject = null; streamActive = null;
                 cameraStatus.innerText = "Passthrough Desativado"; cameraStatus.style.display = 'block';
