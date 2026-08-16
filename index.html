@@ -1286,14 +1286,15 @@
         function togglePerformanceMode(checked) {
             performanceMode = checked;
             document.body.classList.toggle('performance-mode', performanceMode);
-            // Reduz a complexidade do modelo de hand tracking em tempo real p/ economizar CPU/GPU
+            // O modo desempenho reduz ainda mais o número de mãos e a exigência de confiança
+            // (a complexidade do modelo já fica em "lite" sempre — é o que dá o menor atraso)
             if (typeof handsEngine !== 'undefined') {
                 handsEngine.setOptions({
                     selfieMode: false,
                     maxNumHands: performanceMode ? 1 : 2,
-                    modelComplexity: 0,                                  // sempre "lite": é o que dá o melhor equilíbrio velocidade/precisão
-                    minDetectionConfidence: performanceMode ? 0.6 : 0.65,
-                    minTrackingConfidence: performanceMode ? 0.45 : 0.55
+                    modelComplexity: 0,
+                    minDetectionConfidence: performanceMode ? 0.6 : 0.7,
+                    minTrackingConfidence: performanceMode ? 0.45 : 0.6
                 });
             }
         }
@@ -1358,11 +1359,15 @@
         // Ajusta o filtro One Euro de cada mão de acordo com as configurações do usuário.
         // Com o anti-tremor ligado: minCutoff baixo (bem estável). Desligado: minCutoff alto (resposta quase crua).
         function applyHandSmoothingParams() {
-            const minCutoff = antiTremorEnabled ? Math.max(0.4, pointerSmoothing * 4) : 6.0;
-            const beta = antiTremorEnabled ? 0.55 : 0.15;
+            // beta mais alto = o filtro "solta a mão" mais rápido durante movimento veloz
+            // (é o parâmetro do One Euro feito justamente pra reduzir o atraso em movimento)
+            const minCutoff = antiTremorEnabled ? Math.max(0.5, pointerSmoothing * 4) : 7.0;
+            const beta = antiTremorEnabled ? 0.65 : 0.2;
             handSlots.forEach(slot => {
-                slot.filterX.minCutoff = minCutoff; slot.filterX.beta = beta;
-                slot.filterY.minCutoff = minCutoff; slot.filterY.beta = beta;
+                slot.landmarkFiltersX.forEach(f => { f.minCutoff = minCutoff; f.beta = beta; });
+                slot.landmarkFiltersY.forEach(f => { f.minCutoff = minCutoff; f.beta = beta; });
+                // Z fica um pouco mais suave por padrão (profundidade é naturalmente mais ruidosa no MediaPipe)
+                slot.landmarkFiltersZ.forEach(f => { f.minCutoff = Math.max(0.7, minCutoff * 0.8); f.beta = beta * 0.75; });
             });
         }
 
@@ -1387,8 +1392,8 @@
         // ainda está seguran do o hardware — por isso tentamos de novo com pedidos
         // cada vez mais simples antes de desistir de vez.
         const CAMERA_CONSTRAINT_CHAIN = [
-            { video: { facingMode: { exact: "environment" }, width: { ideal: 960 }, height: { ideal: 540 } } },
-            { video: { facingMode: { ideal: "environment" }, width: { ideal: 960 }, height: { ideal: 540 } } },
+            { video: { facingMode: { exact: "environment" }, width: { ideal: 960 }, height: { ideal: 540 }, frameRate: { ideal: 30 } } },
+            { video: { facingMode: { ideal: "environment" }, width: { ideal: 960 }, height: { ideal: 540 }, frameRate: { ideal: 30 } } },
             { video: { facingMode: { ideal: "environment" } } },
             { video: true }
         ];
@@ -4540,11 +4545,18 @@
         }
 
         // Estado por mão (até 2 mãos rastreadas em paralelo)
+        // Cada uma das 21 landmarks tem seu PRÓPRIO filtro One Euro (x, y e z) — não só a
+        // ponta do indicador. Isso deixa o esqueleto inteiro estável e sem tremedeira, com
+        // a MESMA baixa latência do filtro (ele já se adapta sozinho: parado = mais suave,
+        // em movimento rápido = mais responsivo).
         function createHandSlot(index) {
             return {
                 el: document.getElementById(`hand-pointer-${index}`),
-                filterX: new OneEuroFilter(1.3, 0.55),
-                filterY: new OneEuroFilter(1.3, 0.55),
+                landmarkFiltersX: Array.from({ length: 21 }, () => new OneEuroFilter(1.3, 0.55)),
+                landmarkFiltersY: Array.from({ length: 21 }, () => new OneEuroFilter(1.3, 0.55)),
+                landmarkFiltersZ: Array.from({ length: 21 }, () => new OneEuroFilter(2.0, 0.4)),
+                smoothLandmarks: null,       // últimas 21 landmarks já suavizadas (espaço normalizado 0-1)
+                landmarksUpdatedAt: 0,        // timestamp da última leitura REAL do modelo (base da extrapolação)
                 smoothedX: window.innerWidth / 2,
                 smoothedY: window.innerHeight / 2,
                 isPinching: false,
@@ -4558,13 +4570,50 @@
                 hoverTarget: null,
                 handedness: 'Right',
                 wasOpenPalm: false,
-                lastPalmGestureAt: 0
+                lastPalmGestureAt: 0,
+                fistStreak: 0,               // nº de frames seguidos com punho fechado (debounce do gesto)
+                openStreak: 0,               // nº de frames seguidos com mão aberta (debounce do gesto)
+                lastScore: 1                 // confiança da classificação esquerda/direita do MediaPipe
             };
         }
         const handSlots = [createHandSlot(0), createHandSlot(1)];
         const HAND_LOST_TIMEOUT = 260;   // ms — evita "piscar" o ponteiro em falhas curtas de detecção
         const PALM_GESTURE_COOLDOWN = 900; // ms entre acionamentos do gesto de mão aberta
+        const GESTURE_CONFIRM_FRAMES = 2;  // exige N frames seguidos concordando antes de confirmar um gesto (evita flicker)
         applyHandSmoothingParams(); // sincroniza o filtro com as configurações atuais do usuário
+
+        // Passa as 21 landmarks cruas pelo filtro One Euro individual de cada ponto —
+        // suaviza a mão inteira (não só o cursor), mantendo baixa latência. Também guarda
+        // a VELOCIDADE de cada ponto (o filtro já calcula isso internamente) pra podermos
+        // prever/extrapolar a posição entre um resultado do modelo e o próximo — é isso que
+        // faz o esqueleto acompanhar a mão "na hora" mesmo se o modelo de IA só entregar um
+        // resultado novo a cada 40-60ms.
+        function smoothHandLandmarks(slot, landmarks, now) {
+            const out = new Array(21);
+            for (let i = 0; i < 21; i++) {
+                const lm = landmarks[i];
+                const fx = slot.landmarkFiltersX[i], fy = slot.landmarkFiltersY[i], fz = slot.landmarkFiltersZ[i];
+                out[i] = {
+                    x: fx.filter(lm.x, now), y: fy.filter(lm.y, now), z: fz.filter(lm.z, now),
+                    vx: fx.dxPrev || 0, vy: fy.dxPrev || 0, vz: fz.dxPrev || 0 // unidades por segundo (espaço normalizado 0-1)
+                };
+            }
+            return out;
+        }
+
+        // Extrapola a posição atual da mão a partir da última leitura real + sua velocidade.
+        // Limitado a ~90ms pra nunca "viajar" demais se o modelo atrasar ou a mão parar de vez.
+        const MAX_EXTRAPOLATION_MS = 90;
+        function extrapolateHand(slot, now) {
+            if (!slot.smoothLandmarks) return null;
+            const dt = Math.min(Math.max(now - slot.landmarksUpdatedAt, 0), MAX_EXTRAPOLATION_MS) / 1000;
+            if (dt === 0) return slot.smoothLandmarks;
+            return slot.smoothLandmarks.map(p => ({
+                x: p.x + p.vx * dt,
+                y: p.y + p.vy * dt,
+                z: p.z + p.vz * dt
+            }));
+        }
 
         const handBtn = document.getElementById('hand-tracking-btn');
 
@@ -4575,6 +4624,8 @@
             slot.windowBeingDragged = null;
             slot.wasVisible = false;
             slot.wasOpenPalm = false;
+            slot.fistStreak = 0;
+            slot.openStreak = 0;
             if (slot.hoverTarget) { slot.hoverTarget.classList.remove('spatial-hover'); slot.hoverTarget = null; }
         }
 
@@ -4600,9 +4651,9 @@
         handsEngine.setOptions({
             selfieMode: false,              // câmera traseira não é espelhada como uma selfie
             maxNumHands: 2,                 // rastreamento de ambas as mãos, como no Quest 3
-            modelComplexity: 0,             // modelo "lite": bem mais rápido, com precisão ótima pros gestos usados aqui
-            minDetectionConfidence: 0.65,   // um pouco mais permissivo p/ achar a mão mais rápido
-            minTrackingConfidence: 0.55     // mantém o rastreio "travado" na mão por mais tempo, evitando re-detecção cara a cada frame
+            modelComplexity: 0,             // "lite": prioriza VELOCIDADE — resultado novo mais cedo e mais vezes por segundo
+            minDetectionConfidence: 0.7,    // exigente o bastante pra não pegar mão fantasma, mas sem travar a detecção
+            minTrackingConfidence: 0.6      // mais baixo = fica em modo de rastreio "barato" por mais tempo, sem re-detecção cara (que é o que mais atrasa)
         });
 
         // Osso com "glow" em duas camadas (larga/translúcida + fina/nítida) — sem shadowBlur
@@ -4712,42 +4763,51 @@
         }
 
         handsEngine.onResults((results) => {
-            skeletonCtx.clearRect(0, 0, skeletonCanvas.width, skeletonCanvas.height);
             if (!handTrackingActive) return;
 
             const now = performance.now();
             const seenThisFrame = new Set();
+            const usedLabels = new Set();
 
             if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
                 results.multiHandLandmarks.forEach((landmarks, i) => {
-                    if (i > 1) return; // só rastreamos 2 slots visuais
-                    const slot = handSlots[i];
                     const handednessLabel = results.multiHandedness?.[i]?.label || 'Right';
+                    // Identidade estável: sempre mapeia "Left"→slot 0 e "Right"→slot 1 pela
+                    // CLASSIFICAÇÃO da mão, não pela ordem em que o MediaPipe devolve o array
+                    // (essa ordem pode trocar de frame a frame quando as duas mãos estão na
+                    // cena, o que antes causava a mão "pular" de lado no meio do uso).
+                    if (usedLabels.has(handednessLabel)) return; // ignora duplicata rara da mesma mão
+                    usedLabels.add(handednessLabel);
+                    const slotIndex = handednessLabel === 'Left' ? 0 : 1;
+                    const slot = handSlots[slotIndex];
+
+                    // Descarta o frame se a confiança da classificação despencou — evita
+                    // "mão fantasma" tremendo quando o modelo está incerto
+                    const score = results.multiHandedness?.[i]?.score ?? 1;
+                    slot.lastScore = score;
+                    if (score < 0.45) return;
+
                     slot.handedness = handednessLabel;
-                    seenThisFrame.add(i);
+                    seenThisFrame.add(slotIndex);
                     slot.lastSeen = now;
 
                     if (!slot.wasVisible) { slot.firstSeenAt = now; slot.wasVisible = true; }
-                    const appearAlpha = Math.min(1, (now - slot.firstSeenAt) / 180);
 
-                    // Renderiza o esqueleto com cor por mão (azul = direita, violeta = esquerda)
-                    const hue = handednessLabel === 'Left' ? 275 : 208;
-                    const showExtras = !performanceMode;
-                    const pts = renderHandSkeleton(skeletonCtx, landmarks, hue, appearAlpha, showExtras);
+                    // Suaviza as 21 landmarks inteiras (não só a ponta do indicador) —
+                    // esqueleto inteiro fica estável, com a mesma baixa latência do One Euro.
+                    // O DESENHO não acontece mais aqui: fica por conta do loop separado
+                    // (handRenderLoop), que roda a 60fps extrapolando o movimento — assim o
+                    // esqueleto não fica "esperando" o próximo resultado do modelo pra se mexer.
+                    const smoothed = smoothHandLandmarks(slot, landmarks, now);
+                    slot.smoothLandmarks = smoothed;
+                    slot.landmarksUpdatedAt = now;
 
-                    const indexFinger = landmarks[8];
-                    const thumb = landmarks[4];
+                    // Gestos usam as landmarks JÁ suavizadas (dado mais fresco possível, sem extrapolação)
+                    const indexFinger = smoothed[8];
+                    const thumb = smoothed[4];
 
-                    // Filtro One Euro: suaviza sem o "delay" perceptível de uma média/lerp fixa
-                    const targetX = indexFinger.x * window.innerWidth;
-                    const targetY = indexFinger.y * window.innerHeight;
-                    slot.smoothedX = slot.filterX.filter(targetX, now);
-                    slot.smoothedY = slot.filterY.filter(targetY, now);
-
-                    slot.el.classList.add('visible');
-                    slot.el.classList.toggle('hand-left', handednessLabel === 'Left');
-                    slot.el.style.left = `${slot.smoothedX}px`;
-                    slot.el.style.top = `${slot.smoothedY}px`;
+                    slot.smoothedX = indexFinger.x * window.innerWidth;
+                    slot.smoothedY = indexFinger.y * window.innerHeight;
 
                     // Hover espacial: destaca o elemento sob o ponteiro antes de clicar (feedback tipo raycast)
                     const hoverEl = document.elementFromPoint(slot.smoothedX, slot.smoothedY);
@@ -4760,34 +4820,42 @@
                     }
 
                     // --- Gesto 1: pinça (polegar + indicador) = clique / arrastar fino em profundidade ---
+                    // Histerese: o limiar pra ENTRAR na pinça é menor que o limiar pra SAIR dela.
+                    // Sem isso, quando a distância fica exatamente em cima do limiar único, o
+                    // gesto "pisca" (entra/sai várias vezes por segundo) por causa do ruído natural.
                     const distance3D = Math.sqrt(
                         Math.pow(indexFinger.x - thumb.x, 2) +
                         Math.pow(indexFinger.y - thumb.y, 2) +
                         Math.pow(indexFinger.z - thumb.z, 2)
                     );
+                    const pinchEnter = pinchSensitivity;
+                    const pinchExit = pinchSensitivity * 1.35;
 
-                    if (distance3D < pinchSensitivity) {
-                        if (!slot.isPinching) {
-                            slot.isPinching = true;
-                            slot.el.classList.add('pinching');
-                            slot.basePinchDepth = indexFinger.z;
-                            executeSpatialClick(slot, slot.smoothedX, slot.smoothedY);
-                        } else if (slot.windowBeingDragged) {
-                            slot.windowBeingDragged.style.left = `${slot.smoothedX - slot.dragOffsetX}px`;
-                            slot.windowBeingDragged.style.top = `${slot.smoothedY - slot.dragOffsetY}px`;
-                            const deltaZ = (indexFinger.z - slot.basePinchDepth) * -900;
-                            const finalZ = Math.min(Math.max(deltaZ, -zDepthLimit), zDepthLimit * 1.2);
-                            slot.windowBeingDragged.dataset.zDepth = finalZ;
-                            makeSpatial(slot.windowBeingDragged);
-                        }
-                    } else if (slot.isPinching) {
+                    if (!slot.isPinching && distance3D < pinchEnter) {
+                        slot.isPinching = true;
+                        slot.el.classList.add('pinching');
+                        slot.basePinchDepth = indexFinger.z;
+                        executeSpatialClick(slot, slot.smoothedX, slot.smoothedY);
+                    } else if (slot.isPinching && distance3D > pinchExit) {
                         slot.isPinching = false;
                         slot.el.classList.remove('pinching');
                         slot.windowBeingDragged = null;
                     }
+                    if (slot.isPinching && slot.windowBeingDragged) {
+                        slot.windowBeingDragged.style.left = `${slot.smoothedX - slot.dragOffsetX}px`;
+                        slot.windowBeingDragged.style.top = `${slot.smoothedY - slot.dragOffsetY}px`;
+                        const deltaZ = (indexFinger.z - slot.basePinchDepth) * -900;
+                        const finalZ = Math.min(Math.max(deltaZ, -zDepthLimit), zDepthLimit * 1.2);
+                        slot.windowBeingDragged.dataset.zDepth = finalZ;
+                        makeSpatial(slot.windowBeingDragged);
+                    }
 
                     // --- Gesto 2: punho fechado sobre uma janela = "agarra" a janela inteira (reach & grab) ---
-                    const fisted = isFist(landmarks);
+                    // Exige N frames seguidos de punho fechado antes de confirmar — evita agarrar
+                    // sem querer numa transição rápida de dedo (ex: durante a pinça mudando pra punho)
+                    const fistedRaw = isFist(smoothed);
+                    slot.fistStreak = fistedRaw ? slot.fistStreak + 1 : 0;
+                    const fisted = slot.fistStreak >= GESTURE_CONFIRM_FRAMES;
                     if (!slot.isPinching) {
                         if (fisted && !slot.isGrabbing) {
                             const winEl = hoverEl && hoverEl.closest('.vr-window-container');
@@ -4799,14 +4867,14 @@
                                 slot.basePinchDepth = indexFinger.z;
                                 playUiSound(520);
                             }
-                        } else if (slot.isGrabbing && fisted && slot.windowBeingDragged) {
+                        } else if (slot.isGrabbing && fistedRaw && slot.windowBeingDragged) {
                             slot.windowBeingDragged.style.left = `${slot.smoothedX - slot.dragOffsetX}px`;
                             slot.windowBeingDragged.style.top = `${slot.smoothedY - slot.dragOffsetY}px`;
                             const deltaZ = (indexFinger.z - slot.basePinchDepth) * -900;
                             const finalZ = Math.min(Math.max(deltaZ, -zDepthLimit), zDepthLimit * 1.2);
                             slot.windowBeingDragged.dataset.zDepth = finalZ;
                             makeSpatial(slot.windowBeingDragged);
-                        } else if (slot.isGrabbing && !fisted) {
+                        } else if (slot.isGrabbing && !fistedRaw) {
                             // Abrir a mão solta a janela — igual ao "release" de um objeto agarrado no Quest
                             slot.isGrabbing = false;
                             slot.windowBeingDragged = null;
@@ -4814,7 +4882,10 @@
                     }
 
                     // --- Gesto 3: mão aberta e espalmada = abre o menu rápido (menu de pulso, como no Quest) ---
-                    const openPalm = isOpenPalm(landmarks);
+                    // Mesmo debounce de N frames pra confirmar antes de disparar
+                    const openRaw = isOpenPalm(smoothed);
+                    slot.openStreak = openRaw ? slot.openStreak + 1 : 0;
+                    const openPalm = slot.openStreak >= GESTURE_CONFIRM_FRAMES;
                     if (openPalm && !slot.wasOpenPalm && !slot.isPinching && !slot.isGrabbing && (now - slot.lastPalmGestureAt) > PALM_GESTURE_COOLDOWN) {
                         slot.lastPalmGestureAt = now;
                         toggleLauncherPopup();
@@ -4831,6 +4902,41 @@
                 }
             });
         });
+
+        // --- Loop de desenho independente, a 60fps (taxa da TELA, não do modelo de IA) ---
+        // Isso é o que mais reduz o atraso PERCEBIDO: o modelo de mão só entrega um resultado
+        // novo a cada ~40-60ms no celular, mas aqui a gente prevê o movimento entre um
+        // resultado e o outro usando a velocidade de cada ponto (extrapolateHand). O esqueleto
+        // sempre se mexe junto com a mão real, quadro a quadro da tela, em vez de "esperar" o
+        // próximo resultado do MediaPipe pra dar o próximo passo.
+        function handRenderLoop() {
+            if (handTrackingActive) {
+                const now = performance.now();
+                skeletonCtx.clearRect(0, 0, skeletonCanvas.width, skeletonCanvas.height);
+                const showExtras = !performanceMode;
+
+                handSlots.forEach(slot => {
+                    if (!slot.wasVisible || !slot.smoothLandmarks) return;
+                    const extra = extrapolateHand(slot, now);
+                    if (!extra) return;
+
+                    const appearAlpha = Math.min(1, (now - slot.firstSeenAt) / 180) * Math.min(1, (slot.lastScore - 0.3) / 0.5);
+                    renderHandSkeleton(skeletonCtx, extra, 0, appearAlpha, showExtras);
+
+                    // O cursor visual também acompanha a extrapolação — é o ponto onde o
+                    // atraso percebido mais incomoda, então ele é sempre o mais "ao vivo" possível
+                    const idx = extra[8];
+                    const px = idx.x * window.innerWidth;
+                    const py = idx.y * window.innerHeight;
+                    slot.el.classList.add('visible');
+                    slot.el.classList.toggle('hand-left', slot.handedness === 'Left');
+                    slot.el.style.left = `${px}px`;
+                    slot.el.style.top = `${py}px`;
+                });
+            }
+            requestAnimationFrame(handRenderLoop);
+        }
+        requestAnimationFrame(handRenderLoop);
 
         function executeSpatialClick(slot, x, y) {
             const element = document.elementFromPoint(x, y);
